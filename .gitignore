@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+
+# Training artifacts and old model backups
+dqn.pt
+results.csv
+results_*.csv
+*.log
+best_dqn_low.pt
+best_dqn_v*.pt
