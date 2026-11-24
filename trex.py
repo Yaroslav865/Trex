@@ -195,6 +195,24 @@ STATE_JS = """
 """
 
 
+CONTROL_JS = """
+(action) => {
+    const runner = window.Runner && window.Runner.instance_;
+    if (!runner || !runner.tRex) return false;
+    const trex = runner.tRex;
+    if (action === 1) {
+        trex.setDuck(false);
+        trex.startJump(runner.currentSpeed);
+    } else if (action === 2) {
+        if (!trex.jumping) trex.setDuck(true);
+    } else {
+        trex.setDuck(false);
+    }
+    return true;
+}
+"""
+
+
 def read_game(page):
     """Один вызов JS: получить состояние. При ошибке вернуть статус ERROR."""
     try:
@@ -275,25 +293,30 @@ def primary_obstacle(raw):
     return obstacles[-1]
 
 
-def forced_bird_action(raw):
-    """Правило высоты птеродактиля: низкий — прыжок, средний — присед,
-    высокий — бег. Гарантирует правильное действие, не надеясь на сеть."""
+def forced_action(raw):
+    """Правила по типу препятствия, не зависящие от сети:
+    кактус и низкий птеродактиль — прыжок, средний — присед (держать,
+    пока птица не пролетит), высокий — бег."""
     obstacle = primary_obstacle(raw)
     if obstacle is None:
         return None
     cls = obstacle_class(obstacle)
-    if cls not in (BIRD_LOW, BIRD_MID, BIRD_HIGH):
-        return None
 
     speed = max(float(raw["speed"]), 6.0)
     dt = (obstacle["x"] - (raw["x"] + DINO_FRONT_OFFSET)) / speed
 
-    if cls == BIRD_LOW and 8.0 <= dt <= 16.0:
-        return ACTION_JUMP
-    if cls == BIRD_MID and 0.0 <= dt <= 20.0:
-        return ACTION_DUCK
-    if cls == BIRD_HIGH and 0.0 <= dt <= 20.0:
-        return ACTION_RUN
+    if cls == BIRD_LOW:
+        if 6.0 <= dt <= 20.0:
+            return ACTION_JUMP
+        return None
+    if cls == BIRD_MID:
+        if 6.0 <= dt <= 14.0:
+            return ACTION_JUMP
+        return None
+    if cls == BIRD_HIGH:
+        if 0.0 <= dt <= JUMP_MAX_FRAMES:
+            return ACTION_RUN
+        return None
     return None
 
 
@@ -613,34 +636,20 @@ def play_episode(page, agent, episode, max_seconds=None, actor=None,
         # --- выбор и применение действия ---
         if airborne:
             # в воздухе решение уже принято: только отпускаем присед
-            if duck_held:
-                page.keyboard.up("ArrowDown")
-                duck_held = False
             action = ACTION_RUN
             vec = encode(raw)
         else:
             # прыжок разрешён только в зоне препятствия, иначе только бег/присед
             action = actor.act(vec, epsilon, jump_allowed(raw))
-            forced = forced_bird_action(raw)
+            forced = forced_action(raw)
             if forced is not None:
                 action = forced
-            try:
-                if action == ACTION_JUMP:
-                    if duck_held:                 # из приседа нельзя прыгнуть сразу
-                        page.keyboard.up("ArrowDown")
-                        duck_held = False
-                    if not raw["jumping"]:
-                        page.keyboard.press("Space")   # полный прыжок
-                elif action == ACTION_DUCK:
-                    if not duck_held:
-                        page.keyboard.down("ArrowDown")  # удержание
-                        duck_held = True
-                else:
-                    if duck_held:
-                        page.keyboard.up("ArrowDown")    # встать
-                        duck_held = False
-            except Exception:
-                break
+
+        try:
+            page.evaluate(CONTROL_JS, action)
+            duck_held = action == ACTION_DUCK
+        except Exception:
+            break
 
         time.sleep(STEP_DELAY)          # дать игре прожить шаг
         next_raw = read_game(page)      # новое состояние
@@ -649,6 +658,20 @@ def play_episode(page, agent, episode, max_seconds=None, actor=None,
         # --- падение ---
         if next_raw["status"] == "DEAD":
             end_reason = "DEAD"
+            obs = raw.get("obstacles") or []
+            o0 = obs[0] if obs else {}
+            speed = max(float(raw.get("speed", 0)), 6.0)
+            dt = (
+                (o0.get("x", 0) - (raw.get("x", 0) + DINO_FRONT_OFFSET)) / speed
+                if o0 else None
+            )
+            dt_text = f"{dt:.1f}" if dt is not None else "None"
+            log(
+                f"падение: action={action} jumping={raw.get('jumping')} "
+                f"ducking={raw.get('ducking')} x={raw.get('x')} "
+                f"obstacle={o0.get('t')} y={o0.get('y')} "
+                f"dt={dt_text} speed={speed:.2f} forced={forced_action(raw)}"
+            )
             total_reward += CRASH_REWARD
             if airborne and launch_vec is not None:
                 # штраф приписываем прыжку, а не состоянию приземления
@@ -658,7 +681,7 @@ def play_episode(page, agent, episode, max_seconds=None, actor=None,
                 agent.push(vec, action, CRASH_REWARD, vec, True)
             if duck_held:
                 try:
-                    page.keyboard.up("ArrowDown")
+                    page.evaluate(CONTROL_JS, ACTION_RUN)
                 except Exception:
                     pass
             break
@@ -699,7 +722,7 @@ def play_episode(page, agent, episode, max_seconds=None, actor=None,
 
     if duck_held:
         try:
-            page.keyboard.up("ArrowDown")
+            page.evaluate(CONTROL_JS, ACTION_RUN)
         except Exception:
             pass
 
