@@ -60,9 +60,9 @@ uv run trex.py --play   # принудительно финальный забе
 Текущий `best_dqn.pt` (обучен на `MAX_SPEED=13.0`, с птеродактилями и ускорением):
 
 ```text
-distance: 22 480
-score:       562
-decisions: 581 444
+distance: 22 167
+score:       554
+decisions: 582 698
 learn:     294 313
 ```
 

@@ -393,6 +393,14 @@ class Agent:
         clone.learning = False            # push() ничего не делает, epsilon() = 0
         return clone
 
+    def clone_for_behavior(self, epsilon):
+        """Замороженная копия весов на один эпизод: действия стабильны,
+        а обучение продолжает идти в основной online-сети."""
+        clone = self.clone_for_eval()
+        clone.learning = False
+        clone._behavior_epsilon = epsilon
+        return clone
+
     def load(self):
         """Загрузить модель. Лучшая модель приоритетнее последней."""
         source = BEST_FILE if BEST_FILE.exists() else self.path
@@ -522,11 +530,15 @@ def start_game(page):
     return False
 
 
-def play_episode(page, agent, episode, max_seconds=None):
+def play_episode(page, agent, episode, max_seconds=None, actor=None,
+                 epsilon_override=None):
     """Один эпизод: решения, награды, запись переходов в буфер.
 
     max_seconds переопределяет MAX_EPISODE_SECONDS (для проверки рекорда).
+    actor — замороженная политика, которой играет эпизод; agent — сеть,
+    которая продолжает учиться на собранных переходах.
     """
+    actor = actor or agent
     if not start_game(page):
         return None
 
@@ -560,7 +572,9 @@ def play_episode(page, agent, episode, max_seconds=None):
             break
 
         airborne = bool(raw["jumping"])
-        epsilon = agent.epsilon()
+        epsilon = (
+            agent.epsilon() if epsilon_override is None else epsilon_override
+        )
 
         # --- выбор и применение действия ---
         if airborne:
@@ -572,7 +586,7 @@ def play_episode(page, agent, episode, max_seconds=None):
             vec = encode(raw)
         else:
             # прыжок разрешён только в зоне препятствия, иначе только бег/присед
-            action = agent.act(vec, epsilon, jump_allowed(raw))
+            action = actor.act(vec, epsilon, jump_allowed(raw))
             try:
                 if action == ACTION_JUMP:
                     if duck_held:                 # из приседа нельзя прыгнуть сразу
@@ -734,7 +748,15 @@ def window_worker(window_id, agent, stats):
                 break
 
             try:
-                result = play_episode(page, agent, episode)
+                if agent.learning:
+                    eps = agent.epsilon()
+                    actor = agent.clone_for_behavior(eps)
+                    result = play_episode(
+                        page, agent, episode,
+                        actor=actor, epsilon_override=eps,
+                    )
+                else:
+                    result = play_episode(page, agent, episode)
             except Exception as error:
                 log(f"окно {window_id}: страница закрыта/ошибка: {error}")
                 break
