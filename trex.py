@@ -262,16 +262,50 @@ def obstacle_class(obstacle):
     return CACTUS_LARGE
 
 
+def primary_obstacle(raw):
+    """Первое препятствие, которое ещё впереди, а не только что пройдено."""
+    obstacles = raw.get("obstacles") or []
+    if not obstacles:
+        return None
+    speed = max(float(raw["speed"]), 6.0)
+    front = raw["x"] + DINO_FRONT_OFFSET
+    for obstacle in obstacles:
+        if (obstacle["x"] - front) / speed >= 0.0:
+            return obstacle
+    return obstacles[-1]
+
+
+def forced_bird_action(raw):
+    """Правило высоты птеродактиля: низкий — прыжок, средний — присед,
+    высокий — бег. Гарантирует правильное действие, не надеясь на сеть."""
+    obstacle = primary_obstacle(raw)
+    if obstacle is None:
+        return None
+    cls = obstacle_class(obstacle)
+    if cls not in (BIRD_LOW, BIRD_MID, BIRD_HIGH):
+        return None
+
+    speed = max(float(raw["speed"]), 6.0)
+    dt = (obstacle["x"] - (raw["x"] + DINO_FRONT_OFFSET)) / speed
+
+    if cls == BIRD_LOW and 8.0 <= dt <= 16.0:
+        return ACTION_JUMP
+    if cls == BIRD_MID and 0.0 <= dt <= 20.0:
+        return ACTION_DUCK
+    if cls == BIRD_HIGH and 0.0 <= dt <= 20.0:
+        return ACTION_RUN
+    return None
+
+
 def jump_allowed(raw):
     """Прыжок только у препятствия, которое действительно перепрыгивается.
 
     Между кактусами препятствий в зоне прыжка нет - динозавр бежит.
     Среднюю и высокую птицу прыжком не пройти: там нужен присед или бег.
     """
-    obstacles = raw.get("obstacles") or []
-    if not obstacles:
+    obstacle = primary_obstacle(raw)
+    if obstacle is None:
         return False
-    obstacle = obstacles[0]
     speed = max(float(raw["speed"]), 6.0)
     dt = (obstacle["x"] - (raw["x"] + DINO_FRONT_OFFSET)) / speed
     return (
@@ -587,6 +621,9 @@ def play_episode(page, agent, episode, max_seconds=None, actor=None,
         else:
             # прыжок разрешён только в зоне препятствия, иначе только бег/присед
             action = actor.act(vec, epsilon, jump_allowed(raw))
+            forced = forced_bird_action(raw)
+            if forced is not None:
+                action = forced
             try:
                 if action == ACTION_JUMP:
                     if duck_held:                 # из приседа нельзя прыгнуть сразу
