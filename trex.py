@@ -1,5 +1,4 @@
 import random                 # случайные действия (исследование) и выборка из буфера
-import shutil                 # резервная копия low-speed best
 import sys                    # флаги --play / --train
 import threading              # 4 окна = 4 потока + общий доступ к сети и буферу
 import time                   # паузы между решениями и таймауты
@@ -58,10 +57,8 @@ RESUME_EPS_START = 0.0 if TRAIN_GREEDY else 0.10  # старт исследов�
 EPS_END = 0.01            # в конце почти строго по сети, 1% исследования
 EPS_DECAY_DECISIONS = 500_000  # за сколько решений пройти от EPS_START к EPS_END
 
-# учебная программа: (ограничение скорости, средняя дистанция для перехода)
-CURRICULUM = [(6.5, 8000), (9.0, 20000), (13.0, None)]
-FINAL_MAX_SPEED = 13.0    # финал: полная скорость, чтобы были птеродактили
-TRAIN_STAGE = 2           # обучение сразу на MAX_SPEED=13.0
+TRAIN_MAX_SPEED = 13.0    # обучение: полная скорость, чтобы были птеродактили
+FINAL_MAX_SPEED = 13.0    # финал: та же скорость, что и в обучении
 
 SAVE_EVERY = 20                     # сохранять модель каждые N эпизодов
 RECORD_EVERY = 100                  # раз в N эпизодов проверять рекорд без исследования
@@ -79,9 +76,9 @@ N_ACTIONS = 3                                    # сколько выходов
 NO_OBSTACLE = 0     # препятствий нет
 CACTUS_SMALL = 1    # кактус малый
 CACTUS_LARGE = 2    # кактус большой
-BIRD_LOW = 3        # птица у земли: надо прыгать
-BIRD_MID = 4        # птица на средней высоте: надо присесть
-BIRD_HIGH = 5       # птица высоко: можно бежать
+BIRD_LOW = 3        # птица у земли: прыжок
+BIRD_MID = 4        # птица на средней высоте: прыжок
+BIRD_HIGH = 5       # птица высоко: бег
 
 N_INPUT = 12             # размер вектора состояния
 DINO_FRONT_OFFSET = 40   # нос динозавра относительно tRex.xPos
@@ -99,8 +96,6 @@ stop_event = threading.Event()   # сигнал "остановиться" дл�
 episode_lock = threading.Lock()  # защита счётчика эпизодов
 results_lock = threading.Lock()  # защита записи в results.csv
 episodes_started = 0             # сколько эпизодов уже начато
-curriculum_lock = threading.Lock()  # защита номера этапа
-curriculum_stage = 0                # текущий этап учебной программы
 
 
 def log(message):
@@ -108,7 +103,7 @@ def log(message):
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
-RESULTS_HEADER = "time,window,episode,distance,steps,reward,epsilon,stage,reason,best_distance\n"
+RESULTS_HEADER = "time,window,episode,distance,steps,reward,epsilon,reason,best_distance\n"
 
 
 def init_results_file():
@@ -128,12 +123,12 @@ def init_results_file():
         RESULTS_FILE.write_text(RESULTS_HEADER, encoding="utf-8")
 
 
-def write_result(window_id, episode, result, epsilon, stage, best_distance):
+def write_result(window_id, episode, result, epsilon, best_distance):
     """Дописать строку об эпизоде в results.csv."""
     line = (
         f"{time.strftime('%Y-%m-%d %H:%M:%S')},{window_id},{episode},"
         f"{result['distance']},{result['steps']},{result['reward']:.2f},"
-        f"{epsilon:.3f},{stage},{result['reason']},{best_distance}\n"
+        f"{epsilon:.3f},{result['reason']},{best_distance}\n"
     )
     with results_lock:
         with RESULTS_FILE.open("a", encoding="utf-8") as file:
@@ -141,25 +136,8 @@ def write_result(window_id, episode, result, epsilon, stage, best_distance):
 
 
 def current_max_speed():
-    """Текущее ограничение скорости для учебной программы."""
-    with curriculum_lock:
-        return CURRICULUM[curriculum_stage][0]
-
-
-def maybe_advance_curriculum(recent_average):
-    """Перейти на следующий этап, если средняя дистанция выше порога."""
-    global curriculum_stage
-    with curriculum_lock:
-        if curriculum_stage >= len(CURRICULUM) - 1:  # последний этап
-            return False
-        limit = CURRICULUM[curriculum_stage][1]      # порог текущего этапа
-        if limit is None or recent_average < limit:  # ещё рано
-            return False
-        curriculum_stage += 1                        # следующий этап
-        speed = CURRICULUM[curriculum_stage][0]
-        stage = curriculum_stage + 1
-    log(f"учебная программа: этап {stage}, MAX_SPEED={speed}")
-    return True
+    """Ограничение скорости в текущем режиме."""
+    return FINAL_MAX_SPEED if PLAY_BEST else TRAIN_MAX_SPEED
 
 
 # ---------------- чтение состояния из игры ----------------
@@ -293,10 +271,42 @@ def primary_obstacle(raw):
     return obstacles[-1]
 
 
+def cactus_jump_action(raw):
+    """Прыжок через кактус с учётом кластера: прыгаем так, чтобы апекс
+    накрывал и следующий близкий кактус."""
+    obstacle = primary_obstacle(raw)
+    if obstacle is None or obstacle_class(obstacle) not in (
+        CACTUS_SMALL, CACTUS_LARGE
+    ):
+        return None
+
+    speed = max(float(raw["speed"]), 6.0)
+    front = raw["x"] + DINO_FRONT_OFFSET
+    dt = (obstacle["x"] - front) / speed
+    span = obstacle["w"] / speed
+
+    obstacles = raw.get("obstacles") or []
+    if obstacle in obstacles:
+        index = obstacles.index(obstacle)
+        if index + 1 < len(obstacles):
+            second = obstacles[index + 1]
+            if obstacle_class(second) in (CACTUS_SMALL, CACTUS_LARGE):
+                gap = (second["x"] - (obstacle["x"] + obstacle["w"])) / speed
+                if 0.0 <= gap <= 14.0:
+                    span += gap + second["w"] / speed
+
+    earliest = 5.0
+    latest = 21.0 - span
+    if latest < earliest:
+        latest = earliest
+    if earliest <= dt <= latest:
+        return ACTION_JUMP
+    return None
+
+
 def forced_action(raw):
     """Правила по типу препятствия, не зависящие от сети:
-    кактус и низкий птеродактиль — прыжок, средний — присед (держать,
-    пока птица не пролетит), высокий — бег."""
+    кактус и птеродактиль низкий/средний — прыжок, высокий — бег."""
     obstacle = primary_obstacle(raw)
     if obstacle is None:
         return None
@@ -317,14 +327,15 @@ def forced_action(raw):
         if 0.0 <= dt <= JUMP_MAX_FRAMES:
             return ACTION_RUN
         return None
+    if cls in (CACTUS_SMALL, CACTUS_LARGE):
+        return cactus_jump_action(raw)
     return None
 
 
 def jump_allowed(raw):
     """Прыжок только у препятствия, которое действительно перепрыгивается.
 
-    Между кактусами препятствий в зоне прыжка нет - динозавр бежит.
-    Среднюю и высокую птицу прыжком не пройти: там нужен присед или бег.
+    Высокую птицу прыжком не пройти — там нужен бег.
     """
     obstacle = primary_obstacle(raw)
     if obstacle is None:
@@ -522,6 +533,8 @@ class Agent:
             return
         with self.lock:
             self.buffer.append((state, action, reward, next_state, done, discount))
+            # решения принимает замороженная копия, поэтому счётчик ведём здесь
+            self.decisions += 1
             ready = len(self.buffer) >= 1000 and self.decisions % TRAIN_EVERY == 0
         if ready:
             self.learn()
@@ -658,20 +671,6 @@ def play_episode(page, agent, episode, max_seconds=None, actor=None,
         # --- падение ---
         if next_raw["status"] == "DEAD":
             end_reason = "DEAD"
-            obs = raw.get("obstacles") or []
-            o0 = obs[0] if obs else {}
-            speed = max(float(raw.get("speed", 0)), 6.0)
-            dt = (
-                (o0.get("x", 0) - (raw.get("x", 0) + DINO_FRONT_OFFSET)) / speed
-                if o0 else None
-            )
-            dt_text = f"{dt:.1f}" if dt is not None else "None"
-            log(
-                f"падение: action={action} jumping={raw.get('jumping')} "
-                f"ducking={raw.get('ducking')} x={raw.get('x')} "
-                f"obstacle={o0.get('t')} y={o0.get('y')} "
-                f"dt={dt_text} speed={speed:.2f} forced={forced_action(raw)}"
-            )
             total_reward += CRASH_REWARD
             if airborne and launch_vec is not None:
                 # штраф приписываем прыжку, а не состоянию приземления
@@ -749,7 +748,7 @@ def run_record_attempt(page, agent, stats, window_id, episode):
     if stats.record_eval(result["distance"]):
         agent.save_best_from(clone, result["distance"])
     result["reason"] = "EVAL_" + result["reason"]
-    write_result(window_id, episode, result, 0.0, curriculum_stage + 1, stats.best)
+    write_result(window_id, episode, result, 0.0, stats.best)
     log(
         f"окно {window_id} | проверка {episode:4d} | "
         f"дистанция {result['distance']:6d} | рекорд {stats.best} | {result['reason']}"
@@ -780,8 +779,7 @@ def window_worker(window_id, agent, stats):
         page.goto(GAME_URL, wait_until="domcontentloaded")
         time.sleep(1.5)  # дать загрузиться спрайтам
         # финал: полная скорость (появляются птеродактили);
-        # обучение: этап TRAIN_STAGE (MAX_SPEED=13.0)
-        max_speed = FINAL_MAX_SPEED if PLAY_BEST else current_max_speed()
+        max_speed = current_max_speed()
         page.evaluate("v => { Runner.config.MAX_SPEED = v; }", max_speed)
 
         deadline = time.time() + TIME_LIMIT_MINUTES * 60 if TIME_LIMIT_MINUTES else None
@@ -832,10 +830,7 @@ def window_worker(window_id, agent, stats):
             )
             if improved:
                 agent.save_best(result["distance"])
-            write_result(
-                window_id, episode, result,
-                agent.epsilon(), curriculum_stage + 1, stats.best,
-            )
+            write_result(window_id, episode, result, agent.epsilon(), stats.best)
             if episode % SAVE_EVERY == 0 and agent.learning:
                 agent.save()
 
@@ -843,12 +838,10 @@ def window_worker(window_id, agent, stats):
                 f"окно {window_id} | эпизод {episode:4d} | "
                 f"дистанция {result['distance']:6d} | шагов {result['steps']:5d} | "
                 f"награда {result['reward']:7.1f} | eps {agent.epsilon():.2f} | "
-                f"этап {curriculum_stage + 1} | {result['reason']}"
+                f"{result['reason']}"
             )
             if episode % 20 == 0:
                 log(stats.summary())
-                if maybe_advance_curriculum(stats.recent_average()):
-                    page.evaluate("v => { Runner.config.MAX_SPEED = v; }", current_max_speed())
 
             if agent.learning and not TRAIN_GREEDY and episode % RECORD_EVERY == 0:
                 run_record_attempt(page, agent, stats, window_id, episode)
@@ -884,10 +877,6 @@ class Stats:
                 return True
         return False
 
-    def recent_average(self):
-        with self.lock:
-            return sum(self.recent) / len(self.recent) if self.recent else 0.0
-
     def summary(self):
         with self.lock:
             average = sum(self.recent) / len(self.recent) if self.recent else 0
@@ -899,8 +888,6 @@ class Stats:
 
 def main():
     """Точка входа: загрузить модель, поднять окна, ждать, сохранить."""
-    global curriculum_stage
-
     log(f"устройство: {DEVICE}")
     if PLAY_BEST:
         log(
@@ -908,24 +895,10 @@ def main():
             f"MAX_SPEED={FINAL_MAX_SPEED}, без обучения и случайности"
         )
     else:
-        curriculum_stage = max(0, min(TRAIN_STAGE, len(CURRICULUM) - 1))
-        log(
-            f"режим: обучение, этап {curriculum_stage + 1}, "
-            f"MAX_SPEED={current_max_speed()}"
-        )
+        log(f"режим: обучение, MAX_SPEED={TRAIN_MAX_SPEED}")
     init_results_file()        # results.csv появится сразу
     agent = Agent(MODEL_FILE)  # сеть + буфер, общие для всех окон
-
-    if not PLAY_BEST and TRAIN_STAGE > 0:
-        low_best = BEST_FILE.with_name("best_dqn_low.pt")
-        if BEST_FILE.exists() and not low_best.exists():
-            shutil.copy2(BEST_FILE, low_best)
-            log(f"low-speed best сохранён в {low_best.name}")
-        agent.best_distance = 0.0
-        stats = Stats(0.0)
-        log("high-speed best: отсчёт с 0, старый best сохранён")
-    else:
-        stats = Stats(agent.best_distance)
+    stats = Stats(agent.best_distance)
 
     threads = []
     for window_id in range(WINDOWS):
